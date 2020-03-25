@@ -6,15 +6,17 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
+import time
 
 import xdg.BaseDirectory
 
 from datetime import datetime, timedelta
 
 
-re_upper_left_x = re.compile(r"absolute upper-left x:\s*([0-9]+)", re.I)
-re_upper_left_y = re.compile(r"absolute upper-left y:\s*([0-9]+)", re.I)
+re_upper_left_x = re.compile(r"absolute upper-left x:\s*([0-9-]+)", re.I)
+re_upper_left_y = re.compile(r"absolute upper-left y:\s*([0-9-]+)", re.I)
 re_width = re.compile(r"width:\s*([0-9]+)", re.I)
 re_height = re.compile(r"height:\s*([0-9]+)", re.I)
 
@@ -38,6 +40,7 @@ def discover_geometry(args):
         call.append("-root")
 
     output = subprocess.check_output(call).decode()
+    print(output)
     x = int(re_upper_left_x.search(output).group(1))
     y = int(re_upper_left_y.search(output).group(1))
     w = int(re_width.search(output).group(1))
@@ -82,13 +85,17 @@ def extract_ffmpeg_time(line):
 
 
 def ffmpeg_progress(progress_cb, proc):
+    lines = []
     progress_cb(timedelta())
     while proc.returncode is None:
-        time = extract_ffmpeg_time(proc.stderr.readline().decode())
+        line = proc.stderr.readline()
+        lines.append(line)
+        time = extract_ffmpeg_time(line)
         if time is not None:
             progress_cb(time)
         proc.poll()
     progress_cb(None)
+    return lines
 
 
 def ffmpeg_capture_duration(proc):
@@ -142,6 +149,8 @@ def record(cachefile, framerate, display, geometry):
         cachefile
     ])
 
+    print(ffmpeg_call)
+
     proc, duration = run_with_signal_forwarding(ffmpeg_call,
                                                 stderr=subprocess.PIPE,
                                                 wait_fun=ffmpeg_capture_duration)
@@ -167,6 +176,7 @@ def encode(source_file, output_file, config_section, progress_cb):
     ffmpeg_call = [
         "ffmpeg",
         "-nostdin",
+        "-y",
         "-i", source_file,
     ]
 
@@ -178,19 +188,24 @@ def encode(source_file, output_file, config_section, progress_cb):
         if value:
             ffmpeg_call.append(value)
 
-    ffmpeg_call.append("-")
+    # we are not using `-` here, because ffmpeg would assume that it is not
+    # seekable. this leads to incorrect durations in the output file.
+    ffmpeg_call.append("/proc/self/fd/1")
 
     kwargs = {
-        "stdout": output_file,
-        "stderr": subprocess.DEVNULL
+        "stderr": subprocess.DEVNULL,
+        "stdout": output_file
     }
     if progress_cb is not None:
         kwargs["stderr"] = subprocess.PIPE
         kwargs["wait_fun"] = functools.partial(
             ffmpeg_progress, progress_cb)
+        kwargs["universal_newlines"] = True
+        kwargs["bufsize"] = 1
 
-    proc, _ = run_with_signal_forwarding(ffmpeg_call, **kwargs)
+    proc, lines = run_with_signal_forwarding(ffmpeg_call, **kwargs)
     if proc.returncode != 0:
+        print("".join(lines), file=sys.stderr)
         raise subprocess.CalledProcessError(proc.returncode, ffmpeg_call)
 
 
@@ -240,6 +255,14 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--delay", "-d",
+        type=float,
+        metavar="SECONDS",
+        default=0,
+        help="Delay start of recording after selection of region"
+    )
+
+    parser.add_argument(
         "-r", "--framerate",
         metavar="RATE",
         type=int,
@@ -263,6 +286,9 @@ if __name__ == "__main__":
     with open_output_file(
             os.path.expanduser(config.get("encode", "output", fallback="~/out-{}.ogv")
             )) as dest:
+        if args.delay > 0:
+            print("recording starts in {:.2f} s".format(args.delay))
+            time.sleep(args.delay)
         try:
             duration = record(recording_filename, args.framerate, display, geometry)
         except:
